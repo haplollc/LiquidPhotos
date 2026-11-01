@@ -1,7 +1,11 @@
+import CoreGraphics
+import UIKit
 import XCTest
+import simd
 @testable import LiquidPhotos
 
-/// The self-contained maths: the flow solver and the camera's endpoints.
+/// The self-contained maths: the flow solver, the morph's endpoints, and
+/// placing one photo inside another.
 final class LiquidFlowTests: XCTestCase {
     /// A smooth blob moved by a known amount comes back as that motion.
     func testFlowRecoversAShift() {
@@ -25,27 +29,58 @@ final class LiquidFlowTests: XCTestCase {
         XCTAssertEqual(flow.v[centre], -3, accuracy: 1.2)
     }
 
-    /// A transition starts exactly on the first photo at rest and lands
-    /// exactly on the second, whatever their shapes and subjects.
-    func testCameraLandsOnEachPhotoAtRest() {
-        let a = LiquidFrame(aspect: 4 / 3, subject: CGRect(x: 0.1, y: 0.4, width: 0.5, height: 0.5))
-        let b = LiquidFrame(aspect: 2 / 3, subject: CGRect(x: 0.5, y: 0.1, width: 0.3, height: 0.3))
-        let pair = LiquidPairGeometry(a, b)
-        let motion = LiquidMotion()
-        let start = pair.camera(at: 0, startZoom: 1, maxHeight: 1.4, motion: motion)
-        let end = pair.camera(at: 1, startZoom: 1, maxHeight: 1.4, motion: motion)
-        for p in [SIMD2(-0.5, -0.3), SIMD2(0.2, 0.1), SIMD2(0.45, 0.35)] {
-            let qa = start.source(of: p, anchor: a.anchor, size: pair.sizeA)
-            XCTAssertEqual(qa.x, p.x, accuracy: 1e-9)
-            XCTAssertEqual(qa.y, p.y, accuracy: 1e-9)
-            let qb = end.source(of: p, anchor: b.anchor, size: pair.sizeB)
-            XCTAssertEqual(qb.x, p.x, accuracy: 1e-9)
-            XCTAssertEqual(qb.y, p.y, accuracy: 1e-9)
+    /// A morph starts exactly on the first photo's view and lands exactly
+    /// on the second's, and a close-up's view is a small quad in the world.
+    func testMorphLandsExactlyOnEachView() {
+        // The second photo is the region x 0.3...0.7, y 0.2...0.5 of a 4:3 first photo, at 4:3 too.
+        let heightA = 0.75, heightB = 0.75
+        let toB = simd_double3x3(rows: [SIMD3(2.5, 0, -0.75), SIMD3(0, 2.5, -0.5), SIMD3(0, 0, 1)])
+        let morph = LiquidMorph(heightA: heightA, heightB: heightB, toB: toB, related: true)
+        let corners = [SIMD2(0.0, 0.0), SIMD2(1.0, 0.0), SIMD2(1.0, 1.0), SIMD2(0.0, 1.0)]
+        let start = morph.frame(at: 0, maxHeight: 2), end = morph.frame(at: 1, maxHeight: 2)
+        let expectedA = [SIMD2(0, 0), SIMD2(1, 0), SIMD2(1, 0.75), SIMD2(0, 0.75)]
+        let expectedB = [SIMD2(0.3, 0.2), SIMD2(0.7, 0.2), SIMD2(0.7, 0.5), SIMD2(0.3, 0.5)]
+        for i in 0..<4 {
+            let a = project(start.view, corners[i]), b = project(end.view, corners[i])
+            XCTAssertEqual(a.x, expectedA[i].x, accuracy: 1e-9); XCTAssertEqual(a.y, expectedA[i].y, accuracy: 1e-9)
+            XCTAssertEqual(b.x, expectedB[i].x, accuracy: 1e-9); XCTAssertEqual(b.y, expectedB[i].y, accuracy: 1e-9)
         }
-        XCTAssertEqual(start.halfHeight, 0.375, accuracy: 1e-9)
-        XCTAssertEqual(end.halfHeight, 0.7, accuracy: 1e-9)
-        XCTAssertEqual(start.morph, 0)
-        XCTAssertEqual(end.morph, 1)
-        XCTAssertEqual(start.blur, 0, accuracy: 1e-9)
+        XCTAssertEqual(start.blend, 0)
+        XCTAssertEqual(end.blend, 1)
+        // Halfway, the camera's width is the geometric mean: a steady approach.
+        let middle = LiquidView.similarity(of: corners.map { project(morph.frame(at: 0.5, maxHeight: 2).view, $0) })
+        XCTAssertEqual(middle.width, (1.0 * 0.4).squareRoot(), accuracy: 1e-6)
+    }
+
+    /// Vision finds a real close-up inside the wide shot, in the right place,
+    /// and refuses to align two unrelated photos.
+    func testAlignmentPlacesACloseUpAndRejectsStrangers() throws {
+        guard let folder = ProcessInfo.processInfo.environment["LIQUID_PHOTOS"] else {
+            throw XCTSkip("set TEST_RUNNER_LIQUID_PHOTOS to the demo photo folder")
+        }
+        func load(_ name: String) throws -> CGImage {
+            try XCTUnwrap(UIImage(contentsOfFile: folder + "/" + name)?.cgImage)
+        }
+        let wide = try load("01_cat.jpg")
+        let crop = CGRect(x: 0.35, y: 0.15, width: 0.45, height: 0.45)
+        let close = try XCTUnwrap(wide.cropping(to: CGRect(
+            x: crop.minX * Double(wide.width), y: crop.minY * Double(wide.height),
+            width: crop.width * Double(wide.width), height: crop.height * Double(wide.height)
+        )))
+        let a = try XCTUnwrap(LiquidPreparation.info(for: wide))
+        let b = try XCTUnwrap(LiquidPreparation.info(for: close))
+        let (toB, related) = LiquidPreparation.alignment(a, b)
+        XCTAssertTrue(related, "the close-up wasn't recognised")
+        let view = LiquidMorph.band(height: b.height, maxHeight: 100).map { project(toB.inverse, $0) }
+        let expected = [
+            SIMD2(crop.minX, crop.minY * a.height), SIMD2(crop.maxX, crop.minY * a.height),
+            SIMD2(crop.maxX, crop.maxY * a.height), SIMD2(crop.minX, crop.maxY * a.height),
+        ]
+        for i in 0..<4 {
+            XCTAssertEqual(view[i].x, expected[i].x, accuracy: 0.02, "corner \(i)")
+            XCTAssertEqual(view[i].y, expected[i].y, accuracy: 0.02, "corner \(i)")
+        }
+        let stranger = try XCTUnwrap(LiquidPreparation.info(for: try load("02_bullring_city.jpg")))
+        XCTAssertFalse(LiquidPreparation.alignment(a, stranger).1, "a cat and a bullring were aligned")
     }
 }

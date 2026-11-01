@@ -3,12 +3,13 @@
 //  LiquidPhotos
 //
 //  The stage's state machine: which photo is showing, the transition in
-//  flight, playback, and the work done ahead of time (textures, subjects,
+//  flight, playback, and the work done ahead of time (textures, alignments,
 //  flows) so a transition never waits when it can avoid it.
 //
 
 import Metal
 import UIKit
+import simd
 
 /// The recording clock. Everything on the stage runs `pace` times slower
 /// than real time, so a busy machine can record smooth frames that are sped
@@ -19,23 +20,19 @@ public enum LiquidTime {
     public static var pace: Double = 1
 }
 
-/// What the renderer draws this frame.
+/// What the renderer draws this frame. Photo A is the pair's world; B, when
+/// present, is placed in it by `toB`.
 struct LiquidDrawState {
-    var camera: LiquidCamera
+    var frame: LiquidMorphFrame
     var textureA: MTLTexture
-    var frameA: LiquidFrame
-    var sizeA: Double
+    var heightA: Double
     var textureB: MTLTexture?
-    var frameB: LiquidFrame?
-    var sizeB: Double
-    var flow: (texture: MTLTexture, origin: SIMD2<Float>, size: SIMD2<Float>, swapped: Bool)?
+    var heightB: Double
+    var toB: simd_double3x3
+    var flow: (ab: MTLTexture, ba: MTLTexture, origin: SIMD2<Float>, size: SIMD2<Float>)?
     var opacity: Double
-    /// How the camera is moving, for motion blur: the shared anchor's
-    /// velocity (xy, stage widths a second) and the zoom's rate (z, log
-    /// scale a second).
-    var velocity: SIMD3<Double> = .zero
-    /// Frames a second this needs: full rate while morphing, a gentle rate
-    /// for the drift, a trickle while only waiting, none when settled.
+    /// Frames a second this needs: full rate while morphing, a trickle while
+    /// only waiting, none when settled.
     var frameRate: Int
 }
 
@@ -48,8 +45,9 @@ final class LiquidEngine {
     var onSelect: ((Int) -> Void)?
     /// Playback reached the last photo and does not loop.
     var onPlaybackEnd: (() -> Void)?
-    /// A transition started (true) or landed (false).
-    var onMotion: ((Bool) -> Void)?
+    /// A new photo was asked for (true), or one has landed (false), with
+    /// the index of the photo now on screen.
+    var onMotion: ((Bool, Int?) -> Void)?
     /// Called whenever something new is ready to draw.
     var onNeedsDisplay: (() -> Void)?
 
@@ -62,8 +60,8 @@ final class LiquidEngine {
     private var textureUse: [ObjectIdentifier: Int] = [:]
     private var useCounter = 0
     private var loading: Set<ObjectIdentifier> = []
-    private var flows: [PairKey: (flow: LiquidPairFlow, texture: MTLTexture)] = [:]
-    private var flowing: Set<PairKey> = []
+    private var morphs: [PairKey: PreparedMorph] = [:]
+    private var morphing: Set<PairKey> = []
 
     private struct PairKey: Hashable {
         let low: ObjectIdentifier, high: ObjectIdentifier
@@ -73,13 +71,17 @@ final class LiquidEngine {
         }
     }
 
+    private struct PreparedMorph {
+        let morph: LiquidMorph
+        let flow: LiquidMorphFlow
+        let ab: MTLTexture
+        let ba: MTLTexture
+    }
+
     private struct Transition {
         let from: ObjectIdentifier
         let to: ObjectIdentifier
-        let geometry: LiquidPairGeometry
-        let startZoom: Double
-        let flowKey: PairKey?
-        let swapped: Bool
+        let key: PairKey
         var progress: Double = 0
         var speed: Double = 1
     }
@@ -89,16 +91,8 @@ final class LiquidEngine {
     private var transition: Transition?
     private var appear: Double = 1
     private var restTime: Double = 0
-    private var waitingForFlow: Double = 0
     private var playKick = false
     private var isMoving = false
-
-    /// Reports motion from the moment a new photo is asked for until it lands.
-    private func reportMotion(_ moving: Bool) {
-        guard moving != isMoving else { return }
-        isMoving = moving
-        onMotion?(moving)
-    }
 
     var isPlaying = false {
         didSet {
@@ -112,20 +106,26 @@ final class LiquidEngine {
         self.maxPixelSize = maxPixelSize
     }
 
+    /// Reports motion from the moment a new photo is asked for until it lands.
+    private func reportMotion(_ moving: Bool) {
+        guard moving != isMoving else { return }
+        isMoving = moving
+        onMotion?(moving, shown.flatMap { id in photos.firstIndex { $0.id == id } })
+    }
+
     // MARK: Inputs
 
     func setPhotos(_ images: [UIImage], selection: Int) {
         let next = images.map { (id: ObjectIdentifier($0), image: $0) }
-        let changed = next.map(\.id) != photos.map(\.id)
-        photos = next
-        if changed {
+        if next.map(\.id) != photos.map(\.id) {
             let alive = Set(next.map(\.id))
             infos = infos.filter { alive.contains($0.key) }
             textures = textures.filter { alive.contains($0.key) }
-            flows = flows.filter { alive.contains($0.key.low) && alive.contains($0.key.high) }
+            morphs = morphs.filter { alive.contains($0.key.low) && alive.contains($0.key.high) }
             if let t = transition, !alive.contains(t.from) || !alive.contains(t.to) { transition = nil }
             if let s = shown, !alive.contains(s) { shown = nil }
         }
+        photos = next
         select(selection)
     }
 
@@ -143,29 +143,22 @@ final class LiquidEngine {
         onNeedsDisplay?()
     }
 
-    var currentIndex: Int? {
-        guard let shown else { return nil }
-        return photos.firstIndex { $0.id == shown }
-    }
-
     // MARK: Frame
 
     func advance(by realSeconds: Double, maxHeight: Double) -> LiquidDrawState? {
         let dt = min(realSeconds, 0.1) / LiquidTime.pace
         guard !photos.isEmpty else { return nil }
 
-        if shown == nil, let target = requested ?? photos.first?.id {
-            if ensureReady(target) {
-                shown = target
-                if target == requested { reportMotion(false) }
-                appear = 0
-                restTime = 0
-                prefetchNeighbours(of: target)
-            }
+        if shown == nil, let target = requested ?? photos.first?.id, ensureReady(target) {
+            shown = target
+            appear = 0
+            restTime = 0
+            if target == requested { reportMotion(false) }
+            prefetchNeighbours(of: target)
         }
-        guard let shown, let infoA = infos[shown], let textureA = textures[shown] else { return nil }
-
+        guard let shown, let infoShown = infos[shown], let textureShown = textures[shown] else { return nil }
         appear = min(1, appear + dt / 0.35)
+
         if var t = transition {
             t.progress += dt * t.speed / max(style.transitionDuration, 0.05)
             if t.progress >= 1 {
@@ -180,68 +173,52 @@ final class LiquidEngine {
         } else {
             restTime += dt
             advancePlayback()
-            if let target = requested, target != shown, startTransition(from: shown, to: target, dt: dt) {
+            if let target = requested, target != shown, startTransition(from: shown, to: target) {
                 return advance(by: 0, maxHeight: maxHeight)
             }
         }
 
-        let motion = reduceMotion ? LiquidMotion.reduced : LiquidMotion(
-            push: 0.28 * style.push,
-            blur: 0.014 * style.defocus
-        )
-        let driftAmount = style.drift && !reduceMotion ? 0.05 : 0
-
-        if let t = transition, let textureB = textures[t.to] {
-            let camera = t.geometry.camera(at: t.progress, startZoom: t.startZoom, maxHeight: maxHeight, motion: motion)
-            let step = 0.004
-            let ahead = t.geometry.camera(at: min(t.progress + step, 1), startZoom: t.startZoom, maxHeight: maxHeight, motion: motion)
-            let behind = t.geometry.camera(at: max(t.progress - step, 0), startZoom: t.startZoom, maxHeight: maxHeight, motion: motion)
-            let perSecond = t.speed / max(style.transitionDuration, 0.05) / (min(t.progress + step, 1) - max(t.progress - step, 0))
-            let velocity = SIMD3(
-                (ahead.center.x - behind.center.x) * perSecond,
-                (ahead.center.y - behind.center.y) * perSecond,
-                log(ahead.scale / behind.scale) * perSecond
-            )
-            var flow: LiquidDrawState.Flow?
-            if let key = t.flowKey, let f = flows[key], style.morph > 0, !reduceMotion {
-                flow = (f.texture, f.flow.origin, f.flow.size, t.swapped)
-            }
+        if let t = transition, let prepared = morphs[t.key],
+           let low = textures[t.key.low], let high = textures[t.key.high] {
             touch(t.from)
             touch(t.to)
+            // The pair is stored low → high; going the other way plays it backwards.
+            let forward = t.from == t.key.low
+            let raw = forward ? t.progress : 1 - t.progress
+            var frame = prepared.morph.frame(at: raw, maxHeight: maxHeight)
+            if reduceMotion {
+                // A plain cross-fade in place.
+                let held = LiquidMorph.resting(height: forward ? prepared.morph.heightA : prepared.morph.heightB, maxHeight: maxHeight)
+                frame.view = held.view
+                frame.motion = 0
+            }
             return LiquidDrawState(
-                camera: camera,
-                textureA: textures[t.from] ?? textureA,
-                frameA: t.geometry.a, sizeA: t.geometry.sizeA,
-                textureB: textureB,
-                frameB: t.geometry.b, sizeB: t.geometry.sizeB,
-                flow: flow,
+                frame: frame,
+                textureA: low, heightA: prepared.morph.heightA,
+                textureB: high, heightB: prepared.morph.heightB,
+                toB: prepared.morph.toB,
+                flow: style.morph > 0 && !reduceMotion ? (prepared.ab, prepared.ba, prepared.flow.origin, prepared.flow.size) : nil,
                 opacity: appear,
-                velocity: reduceMotion ? .zero : velocity,
                 frameRate: 120
             )
         }
 
-        let frame = infoA.frame
-        let zoom = LiquidEase.drift(after: restTime, amount: driftAmount)
         touch(shown)
+        let pending = requested != nil && requested != shown
         return LiquidDrawState(
-            camera: frame.restingCamera(zoom: zoom, maxHeight: maxHeight),
-            textureA: textureA, frameA: frame, sizeA: frame.anchorSize,
-            textureB: nil, frameB: nil, sizeB: 1,
+            frame: LiquidMorph.resting(height: infoShown.height, maxHeight: maxHeight),
+            textureA: textureShown, heightA: infoShown.height,
+            textureB: nil, heightB: 1, toB: matrix_identity_double3x3,
             flow: nil,
             opacity: appear,
-            frameRate: appear < 1 ? 60
-                : driftAmount > 0 && restTime < 25 ? 30
-                : isPlaying || (requested != nil && requested != shown) ? 10
-                : 0
+            frameRate: appear < 1 ? 60 : (isPlaying || pending || playKick ? 10 : 0)
         )
     }
 
     private func advancePlayback() {
         guard isPlaying, photos.count > 1, let shown, requested == shown,
               let index = photos.firstIndex(where: { $0.id == shown }) else { return }
-        let due = playKick ? 0.15 : style.holdDuration
-        guard restTime >= due else { return }
+        guard restTime >= (playKick ? 0.15 : style.holdDuration) else { return }
         if index == photos.count - 1, !style.loops {
             isPlaying = false
             onPlaybackEnd?()
@@ -254,36 +231,22 @@ final class LiquidEngine {
         onSelect?(next)
     }
 
-    /// Starts the transition if both photos (and ideally their flow) are ready.
-    private func startTransition(from a: ObjectIdentifier, to b: ObjectIdentifier, dt: Double) -> Bool {
-        guard ensureReady(a), ensureReady(b), let infoA = infos[a], let infoB = infos[b] else { return false }
+    /// Starts the transition once both photos and their morph are ready.
+    private func startTransition(from a: ObjectIdentifier, to b: ObjectIdentifier) -> Bool {
+        guard ensureReady(a), ensureReady(b) else { return false }
         let key = PairKey(a, b)
-        let flowReady = flows[key] != nil || reduceMotion || style.morph <= 0
-        if !flowReady {
-            ensureFlow(key)
-            waitingForFlow += dt * LiquidTime.pace
-            // Never hold the user up for long; go without the flow instead.
-            if waitingForFlow < 1.2 { return false }
+        guard morphs[key] != nil else {
+            ensureMorph(key)
+            return false
         }
-        waitingForFlow = 0
-        let swapped = a != key.low
-        let lowInfo = swapped ? infoB : infoA, highInfo = swapped ? infoA : infoB
-        let canonical = LiquidPairGeometry(lowInfo.frame, highInfo.frame)
-        let driftAmount = style.drift && !reduceMotion ? 0.05 : 0
-        transition = Transition(
-            from: a, to: b,
-            geometry: swapped ? canonical.reversed : canonical,
-            startZoom: LiquidEase.drift(after: restTime, amount: driftAmount),
-            flowKey: flows[key] != nil ? key : nil,
-            swapped: swapped
-        )
+        transition = Transition(from: a, to: b, key: key)
         reportMotion(true)
         return true
     }
 
     // MARK: Preparation
 
-    /// True when the photo's subject and texture are ready; otherwise starts
+    /// True when the photo's info and texture are ready; otherwise starts
     /// preparing it.
     @discardableResult
     private func ensureReady(_ id: ObjectIdentifier, urgent: Bool = true) -> Bool {
@@ -309,8 +272,8 @@ final class LiquidEngine {
                     self.touch(id)
                     self.evictTextures()
                 }
-                // A neighbour's subject is known now, so its flow can start,
-                // while resting rather than mid-transition.
+                // A neighbour is known now, so its morph can start, while
+                // resting rather than mid-transition.
                 if self.transition == nil, let shown = self.shown, shown != id {
                     self.prefetchNeighbours(of: shown)
                 }
@@ -320,33 +283,33 @@ final class LiquidEngine {
         return false
     }
 
-    private func ensureFlow(_ key: PairKey, urgent: Bool = true) {
-        guard flows[key] == nil, !flowing.contains(key), let a = infos[key.low], let b = infos[key.high] else { return }
-        flowing.insert(key)
+    private func ensureMorph(_ key: PairKey, urgent: Bool = true) {
+        guard morphs[key] == nil, !morphing.contains(key), let a = infos[key.low], let b = infos[key.high] else { return }
+        morphing.insert(key)
         let device = UncheckedSendable(value: device)
         Task.detached(priority: urgent ? .userInitiated : .utility) {
-            let geometry = LiquidPairGeometry(a.frame, b.frame)
-            let flow = LiquidPreparation.pairFlow(a, b, geometry: geometry)
-            let texture = UncheckedSendable(value: flow.texture(device: device.value))
+            let (morph, flow) = LiquidPreparation.morph(a, b)
+            let textures = UncheckedSendable(value: flow.textures(device: device.value))
             await MainActor.run { [weak self] in
                 guard let self else { return }
-                self.flowing.remove(key)
-                if let t = texture.value { self.flows[key] = (flow, t) }
+                self.morphing.remove(key)
+                if let (ab, ba) = textures.value {
+                    self.morphs[key] = PreparedMorph(morph: morph, flow: flow, ab: ab, ba: ba)
+                }
                 self.onNeedsDisplay?()
             }
         }
     }
 
-    /// Gets the photos either side ready, and their flows with this one.
+    /// Gets the photos either side ready, and their morphs with this one, at
+    /// low priority so it never steals frames from what is on screen.
     private func prefetchNeighbours(of id: ObjectIdentifier) {
         guard let index = photos.firstIndex(where: { $0.id == id }), photos.count > 1 else { return }
         let next = photos[(index + 1) % photos.count].id
         let previous = photos[(index - 1 + photos.count) % photos.count].id
-        // Low priority, so preparing what comes next never steals frames
-        // from what is on screen.
         for other in [next, previous] where other != id {
             ensureReady(other, urgent: false)
-            ensureFlow(PairKey(id, other), urgent: false)
+            ensureMorph(PairKey(id, other), urgent: false)
         }
     }
 
@@ -366,8 +329,4 @@ final class LiquidEngine {
             textures[id] = nil
         }
     }
-}
-
-extension LiquidDrawState {
-    typealias Flow = (texture: MTLTexture, origin: SIMD2<Float>, size: SIMD2<Float>, swapped: Bool)
 }
