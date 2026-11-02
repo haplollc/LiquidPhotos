@@ -26,6 +26,8 @@ struct LiquidPhotoInfo: Sendable {
     let aspect: Double
     /// About 160 px wide: luma and two opponent chroma planes, 0...1.
     let thumbnail: FlowImage
+    /// About 320 px wide, RGB 0...1: for matching patches and their colours.
+    let detail: FlowImage
 
     /// Height in widths.
     var height: Double { 1 / max(aspect, 0.05) }
@@ -52,7 +54,11 @@ enum LiquidPreparation {
     /// Reads a photo's shape and its thumbnail for alignment and flow.
     static func info(for image: CGImage) -> LiquidPhotoInfo? {
         let aspect = Double(image.width) / Double(max(image.height, 1))
-        return LiquidPhotoInfo(aspect: aspect, thumbnail: flowThumbnail(of: image, width: 160))
+        return LiquidPhotoInfo(
+            aspect: aspect,
+            thumbnail: flowThumbnail(of: image, width: 160),
+            detail: flowThumbnail(of: image, width: 320, opponent: false)
+        )
     }
 
     /// A texture with a full mip chain, so the shader can defocus cheaply.
@@ -69,7 +75,7 @@ enum LiquidPreparation {
     // MARK: Flow
 
     /// A `width`-pixel-wide copy in luma + opponent chroma, values 0...1.
-    static func flowThumbnail(of image: CGImage, width: Int) -> FlowImage {
+    static func flowThumbnail(of image: CGImage, width: Int, opponent: Bool = true) -> FlowImage {
         let w = max(8, width)
         let h = max(8, Int((Double(w) * Double(image.height) / Double(max(image.width, 1))).rounded()))
         var bytes = [UInt8](repeating: 0, count: w * h * 4)
@@ -87,6 +93,12 @@ enum LiquidPreparation {
         guard drawn else { return out }
         for i in 0..<(w * h) {
             let r = Float(bytes[i * 4]) / 255, g = Float(bytes[i * 4 + 1]) / 255, b = Float(bytes[i * 4 + 2]) / 255
+            guard opponent else {
+                out.planes[0][i] = r
+                out.planes[1][i] = g
+                out.planes[2][i] = b
+                continue
+            }
             out.planes[0][i] = 0.299 * r + 0.587 * g + 0.114 * b
             out.planes[1][i] = 0.5 + 0.5 * (r - g)
             out.planes[2][i] = 0.5 + 0.5 * (0.5 * (r + g) - b)
@@ -98,11 +110,13 @@ enum LiquidPreparation {
 
     /// Places photo `b` in photo `a`'s world and works out how every pixel
     /// moves between them.
-    static func morph(_ a: LiquidPhotoInfo, _ b: LiquidPhotoInfo) -> (LiquidMorph, LiquidMorphFlow) {
+    static func morph(_ a: LiquidPhotoInfo, _ b: LiquidPhotoInfo) -> (LiquidMorph, LiquidMeshData) {
         let (toB, related) = alignment(a, b)
         let morph = LiquidMorph(heightA: a.height, heightB: b.height, toB: toB, related: related)
-        // Related photos have real motion to follow, so they get a finer field.
-        return (morph, flow(a, b, morph, gridLongSide: related ? 176 : 128))
+        // The dense flow only proposes correspondences; the mesh keeps the
+        // ones that really match and moves the picture in solid pieces.
+        let proposals = flow(a, b, morph, gridLongSide: related ? 128 : 64)
+        return (morph, LiquidMeshFit.fit(a, b, morph, flow: proposals))
     }
 
     /// World → `b`'s coordinates, and whether `b` really is `a`'s scene.

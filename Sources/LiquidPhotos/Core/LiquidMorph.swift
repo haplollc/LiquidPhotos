@@ -30,6 +30,9 @@ struct LiquidMorphFrame: Equatable, Sendable {
     var motion: Double
     /// How much of the second photo shows, 0...1.
     var blend: Double
+    /// The same, for regions that match: they look alike once moved and
+    /// re-tinted, so they can hand over quickly in the middle.
+    var quickBlend: Double = 0
 }
 
 /// The fixed relationship between two photos, worked out once per pair.
@@ -89,7 +92,8 @@ struct LiquidMorph: Sendable {
             halfHeight: visible / 2,
             view: LiquidView.squareToQuad(quad),
             motion: e,
-            blend: LiquidEase.step(0.12, 0.88, t)
+            blend: LiquidEase.step(0.12, 0.88, t),
+            quickBlend: LiquidEase.step(0.3, 0.7, t)
         )
     }
 

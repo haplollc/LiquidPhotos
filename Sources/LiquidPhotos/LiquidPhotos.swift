@@ -129,6 +129,7 @@ private struct LiquidStage: UIViewRepresentable {
 final class LiquidStageView: MTKView {
     private(set) var engine: LiquidEngine?
     private var pipeline: MTLRenderPipelineState?
+    private var meshPipeline: MTLRenderPipelineState?
     private var queue: MTLCommandQueue?
     private var fallbackTexture: MTLTexture?
     private var displayLink: CADisplayLink?
@@ -153,7 +154,8 @@ final class LiquidStageView: MTKView {
         queue = device.makeCommandQueue()
         engine = LiquidEngine(device: device)
         engine?.onNeedsDisplay = { [weak self] in self?.wake() }
-        pipeline = Self.makePipeline(device: device, format: colorPixelFormat)
+        pipeline = Self.makePipeline(device: device, format: colorPixelFormat, vertex: "liquidVertex", fragment: "liquidFragment")
+        meshPipeline = Self.makePipeline(device: device, format: colorPixelFormat, vertex: "liquidMeshVertex", fragment: "liquidMeshFragment")
         fallbackTexture = Self.makeFallbackTexture(device: device)
     }
 
@@ -229,9 +231,18 @@ final class LiquidStageView: MTKView {
             encoder.setFragmentBytes(&uniforms, length: MemoryLayout<SIMD4<Float>>.stride * uniforms.count, index: 0)
             encoder.setFragmentTexture(state.textureA, index: 0)
             encoder.setFragmentTexture(state.textureB ?? fallbackTexture, index: 1)
-            encoder.setFragmentTexture(state.flow?.ab ?? fallbackTexture, index: 2)
-            encoder.setFragmentTexture(state.flow?.ba ?? fallbackTexture, index: 3)
+            encoder.setFragmentTexture(fallbackTexture, index: 2)
+            encoder.setFragmentTexture(fallbackTexture, index: 3)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            // Over the plain cross-fade, the picture moved in solid pieces.
+            if let mesh = state.mesh, let meshPipeline {
+                var meshUniforms = makeMeshUniforms(state, drawableSize: drawableSize)
+                encoder.setRenderPipelineState(meshPipeline)
+                encoder.setVertexBytes(&meshUniforms, length: MemoryLayout<SIMD4<Float>>.stride * meshUniforms.count, index: 0)
+                encoder.setVertexBuffer(mesh.vertices, offset: 0, index: 1)
+                encoder.setFragmentBytes(&meshUniforms, length: MemoryLayout<SIMD4<Float>>.stride * meshUniforms.count, index: 0)
+                encoder.drawIndexedPrimitives(type: .triangle, indexCount: mesh.count, indexType: .uint16, indexBuffer: mesh.indices, indexBufferOffset: 0)
+            }
         }
         encoder.endEncoding()
         buffer.present(drawable)
@@ -261,18 +272,42 @@ final class LiquidStageView: MTKView {
             row(f.view, 1, s.heightA),
             row(f.view, 2, s.heightB),
             row(s.toB, 0, s.textureB == nil ? 0 : 1),
-            row(s.toB, 1, s.flow == nil ? 0 : engine?.style.morph ?? 1),
+            row(s.toB, 1, 0),
             row(s.toB, 2, s.opacity),
-            SIMD4(s.flow?.origin.x ?? 0, s.flow?.origin.y ?? 0, s.flow?.size.x ?? 1, s.flow?.size.y ?? 1),
+            SIMD4(0, 0, 1, 1),
         ]
     }
 
-    private static func makePipeline(device: MTLDevice, format: MTLPixelFormat) -> MTLRenderPipelineState? {
+    /// The mesh pass: frame geometry, the camera's inverse (world → frame
+    /// unit square), and the transition's progress.
+    private func makeMeshUniforms(_ s: LiquidDrawState, drawableSize: CGSize) -> [SIMD4<Float>] {
+        let f = s.frame
+        let inverse = f.view.inverse
+        func row(_ r: Int) -> SIMD4<Float> { SIMD4(Float(inverse[0][r]), Float(inverse[1][r]), Float(inverse[2][r]), 0) }
+        return [
+            SIMD4(Float(drawableSize.width), Float(drawableSize.height), Float(drawableSize.width), Float(f.halfHeight)),
+            SIMD4(Float(drawableSize.width) / 2, Float(drawableSize.height) / 2,
+                  Float(cornerRadius / max(bounds.width, 1)), Float(f.blend)),
+            SIMD4(Float(f.quickBlend), Float(f.motion), Float(s.opacity), Float(engine?.style.morph ?? 1)),
+            row(0), row(1), row(2),
+        ]
+    }
+
+    private static func makePipeline(device: MTLDevice, format: MTLPixelFormat, vertex: String, fragment: String) -> MTLRenderPipelineState? {
         guard let library = try? device.makeDefaultLibrary(bundle: .module) else { return nil }
         let descriptor = MTLRenderPipelineDescriptor()
-        descriptor.vertexFunction = library.makeFunction(name: "liquidVertex")
-        descriptor.fragmentFunction = library.makeFunction(name: "liquidFragment")
+        descriptor.vertexFunction = library.makeFunction(name: vertex)
+        descriptor.fragmentFunction = library.makeFunction(name: fragment)
         descriptor.colorAttachments[0].pixelFormat = format
+        if vertex == "liquidMeshVertex" {
+            // The mesh lays its pieces over the cross-fade (premultiplied alpha).
+            let attachment = descriptor.colorAttachments[0]!
+            attachment.isBlendingEnabled = true
+            attachment.sourceRGBBlendFactor = .one
+            attachment.sourceAlphaBlendFactor = .one
+            attachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            attachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        }
         return try? device.makeRenderPipelineState(descriptor: descriptor)
     }
 

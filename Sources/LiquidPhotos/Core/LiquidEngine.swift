@@ -29,7 +29,8 @@ struct LiquidDrawState {
     var textureB: MTLTexture?
     var heightB: Double
     var toB: simd_double3x3
-    var flow: (ab: MTLTexture, ba: MTLTexture, origin: SIMD2<Float>, size: SIMD2<Float>)?
+    /// The pair's warp mesh, drawn over a plain cross-fade.
+    var mesh: (vertices: MTLBuffer, indices: MTLBuffer, count: Int)?
     var opacity: Double
     /// Frames a second this needs: full rate while morphing, a trickle while
     /// only waiting, none when settled.
@@ -73,9 +74,9 @@ final class LiquidEngine {
 
     private struct PreparedMorph {
         let morph: LiquidMorph
-        let flow: LiquidMorphFlow
-        let ab: MTLTexture
-        let ba: MTLTexture
+        let vertices: MTLBuffer
+        let indices: MTLBuffer
+        let count: Int
     }
 
     private struct Transition {
@@ -197,7 +198,7 @@ final class LiquidEngine {
                 textureA: low, heightA: prepared.morph.heightA,
                 textureB: high, heightB: prepared.morph.heightB,
                 toB: prepared.morph.toB,
-                flow: style.morph > 0 && !reduceMotion ? (prepared.ab, prepared.ba, prepared.flow.origin, prepared.flow.size) : nil,
+                mesh: style.morph > 0 && !reduceMotion ? (prepared.vertices, prepared.indices, prepared.count) : nil,
                 opacity: appear,
                 frameRate: 120
             )
@@ -209,7 +210,7 @@ final class LiquidEngine {
             frame: LiquidMorph.resting(height: infoShown.height, maxHeight: maxHeight),
             textureA: textureShown, heightA: infoShown.height,
             textureB: nil, heightB: 1, toB: matrix_identity_double3x3,
-            flow: nil,
+            mesh: nil,
             opacity: appear,
             frameRate: appear < 1 ? 60 : (isPlaying || pending || playKick ? 10 : 0)
         )
@@ -288,13 +289,16 @@ final class LiquidEngine {
         morphing.insert(key)
         let device = UncheckedSendable(value: device)
         Task.detached(priority: urgent ? .userInitiated : .utility) {
-            let (morph, flow) = LiquidPreparation.morph(a, b)
-            let textures = UncheckedSendable(value: flow.textures(device: device.value))
+            let (morph, mesh) = LiquidPreparation.morph(a, b)
+            let buffers = UncheckedSendable(value: (
+                device.value.makeBuffer(bytes: mesh.vertices, length: mesh.vertices.count * MemoryLayout<LiquidMeshVertex>.stride),
+                device.value.makeBuffer(bytes: mesh.indices, length: mesh.indices.count * MemoryLayout<UInt16>.stride)
+            ))
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.morphing.remove(key)
-                if let (ab, ba) = textures.value {
-                    self.morphs[key] = PreparedMorph(morph: morph, flow: flow, ab: ab, ba: ba)
+                if let vertices = buffers.value.0, let indices = buffers.value.1 {
+                    self.morphs[key] = PreparedMorph(morph: morph, vertices: vertices, indices: indices, count: mesh.indices.count)
                 }
                 self.onNeedsDisplay?()
             }

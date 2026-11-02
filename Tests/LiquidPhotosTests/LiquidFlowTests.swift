@@ -83,4 +83,29 @@ final class LiquidFlowTests: XCTestCase {
         let stranger = try XCTUnwrap(LiquidPreparation.info(for: try load("02_bullring_city.jpg")))
         XCTAssertFalse(LiquidPreparation.alignment(a, stranger).1, "a cat and a bullring were aligned")
     }
+
+    /// A close-up is the same picture, so the mesh should find plenty of
+    /// verified matches and need no local motion on top of the camera: the
+    /// regions stay the same and only zoom.
+    func testCloseUpMeshKeepsRegionsRigid() throws {
+        guard let folder = ProcessInfo.processInfo.environment["LIQUID_PHOTOS"] else {
+            throw XCTSkip("set TEST_RUNNER_LIQUID_PHOTOS to the demo photo folder")
+        }
+        let wide = try XCTUnwrap(UIImage(contentsOfFile: folder + "/01_cat.jpg")?.cgImage)
+        let close = try XCTUnwrap(wide.cropping(to: CGRect(x: 0.35 * Double(wide.width), y: 0.15 * Double(wide.height),
+                                                           width: 0.45 * Double(wide.width), height: 0.45 * Double(wide.height))))
+        let a = try XCTUnwrap(LiquidPreparation.info(for: wide)), b = try XCTUnwrap(LiquidPreparation.info(for: close))
+        let started = Date()
+        let (morph, mesh) = LiquidPreparation.morph(a, b)
+        print("[liquid-mesh] related \(morph.related), \(mesh.matchCount) matches, \(String(format: "%.2f", Date().timeIntervalSince(started))) s")
+        XCTAssertTrue(morph.related)
+        XCTAssertGreaterThan(mesh.matchCount, 60)
+        let confident = mesh.vertices.filter { $0.gain.w > 0.5 }
+        XCTAssertFalse(confident.isEmpty)
+        let moves = confident.map { simd_length($0.worldB - $0.worldA) }.sorted()
+        let median = moves[moves.count / 2], p90 = moves[moves.count * 9 / 10]
+        print("[liquid-mesh] local motion over the camera: median \(median), p90 \(p90), max \(moves.last!)")
+        XCTAssertLessThan(median, 0.004, "matched regions should only ride the camera")
+        XCTAssertLessThan(p90, 0.01, "matched regions should only ride the camera")
+    }
 }
