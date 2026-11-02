@@ -98,6 +98,8 @@ final class LiquidEngine {
     var isPlaying = false {
         didSet {
             if isPlaying, !oldValue { playKick = true }
+            // Paused while waiting to move on: nothing is moving after all.
+            if !isPlaying, transition == nil, requested == shown { reportMotion(false) }
             onNeedsDisplay?()
         }
     }
@@ -225,8 +227,21 @@ final class LiquidEngine {
             onPlaybackEnd?()
             return
         }
-        playKick = false
         let next = (index + 1) % photos.count
+        // Move on only once the next morph is prepared, so the selection (and
+        // a strip following it) moves with the stage instead of ahead of it.
+        // Waiting counts as on the way: the stage reports it's moving on.
+        guard ensureReady(photos[next].id) else {
+            reportMotion(true)
+            return
+        }
+        let key = PairKey(shown, photos[next].id)
+        guard morphs[key] != nil else {
+            ensureMorph(key)
+            reportMotion(true)
+            return
+        }
+        playKick = false
         requested = photos[next].id
         reportMotion(true)
         onSelect?(next)

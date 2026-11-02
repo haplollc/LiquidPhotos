@@ -2,13 +2,16 @@
 //  LiquidPhotoStrip.swift
 //  LiquidPhotos
 //
-//  The filmstrip under the stage: small rounded thumbnails, the selected one
-//  larger and centred. Tap one to morph to it, or swipe the strip.
+//  The filmstrip under the stage: a shelf of photos stacked edge-on like CDs,
+//  the one on screen turned out to face you. Choosing another flips it out of
+//  the stack in 3D while the last one turns back in. Tap one to morph to it,
+//  or drag the shelf.
 //
 
 import SwiftUI
 
-/// A thumbnail strip centred on the selected photo.
+/// A shelf of thumbnails centred on the selected photo, with an optional
+/// trailing view (e.g. an add button) pinned at its right edge.
 public struct LiquidPhotoStrip<Trailing: View>: View {
     private let images: [UIImage]
     @Binding private var selection: Int
@@ -17,9 +20,9 @@ public struct LiquidPhotoStrip<Trailing: View>: View {
     @State private var drag: CGFloat = 0
 
     /// - Parameters:
-    ///   - size: The side of an unselected thumbnail; the selected one is a
+    ///   - size: The side of a stacked thumbnail; the one facing you is a
     ///     quarter larger.
-    ///   - trailing: Shown after the last thumbnail, e.g. an add button.
+    ///   - trailing: Pinned at the right edge, e.g. an add button.
     public init(
         _ images: [UIImage],
         selection: Binding<Int>,
@@ -32,32 +35,36 @@ public struct LiquidPhotoStrip<Trailing: View>: View {
         self.trailing = trailing()
     }
 
-    private var spacing: CGFloat { size * 0.12 }
     /// Follows the recording clock, so a paced take keeps the strip in step.
-    private var glide: Animation { .spring(response: 0.42 * LiquidTime.pace, dampingFraction: 0.86) }
-    private var selectedSize: CGFloat { size * 1.27 }
+    private var glide: Animation { .spring(response: 0.5 * LiquidTime.pace, dampingFraction: 0.86) }
+    private var facingSize: CGFloat { size * 1.27 }
+    /// From the facing card's centre to the first stacked one.
+    private var first: CGFloat { facingSize * 0.78 }
+    /// Between stacked cards: their spines.
+    private var spine: CGFloat { size * 0.22 }
+    /// How many stacked cards show on each side; the rest fade into the stack.
+    private let shown = 8.0
 
     public var body: some View {
         GeometryReader { proxy in
-            let step = size + spacing
             let selected = images.isEmpty ? 0 : min(max(selection, 0), images.count - 1)
-            let centre = images.isEmpty ? -spacing : CGFloat(selected) * step + selectedSize / 2
-            HStack(spacing: spacing) {
+            let scrub = -drag / (spine * 2.5)
+            ZStack {
                 ForEach(images.indices, id: \.self) { index in
-                    StripThumbnail(image: images[index], isSelected: index == selected, side: index == selected ? selectedSize : size)
+                    let d = Double(index - selected) + scrub
+                    let pose = Pose(d, first: first, spine: spine, shown: shown)
+                    StripThumbnail(image: images[index], isFacing: index == selected, side: facingSize, turn: pose.turn)
+                        .scaleEffect(pose.scale)
+                        .opacity(pose.opacity)
+                        .position(x: proxy.size.width / 2 + pose.x, y: proxy.size.height / 2)
+                        .zIndex(-abs(d))
                         .onTapGesture { selection = index }
                         .accessibilityElement()
                         .accessibilityLabel("Photo \(index + 1)")
                         .accessibilityAddTraits(index == selected ? [.isButton, .isSelected] : .isButton)
                         .accessibilityIdentifier("liquidPhotos.thumb.\(index)")
                 }
-                trailing
             }
-            .fixedSize()
-            // A layout shift, not an offset, so hit testing and accessibility
-            // frames follow the thumbnails.
-            .alignmentGuide(.leading) { _ in centre + -proxy.size.width / 2 - drag }
-            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .leading)
             .animation(glide, value: selected)
             .animation(glide, value: images.count)
             .contentShape(Rectangle())
@@ -65,7 +72,7 @@ public struct LiquidPhotoStrip<Trailing: View>: View {
                 DragGesture(minimumDistance: 8)
                     .onChanged { drag = $0.translation.width }
                     .onEnded { value in
-                        let moved = Int((-value.predictedEndTranslation.width / step).rounded())
+                        let moved = Int((-value.predictedEndTranslation.width / (spine * 2.5)).rounded())
                         withAnimation(glide) {
                             drag = 0
                             if !images.isEmpty {
@@ -75,18 +82,41 @@ public struct LiquidPhotoStrip<Trailing: View>: View {
                     }
             )
         }
-        .frame(height: selectedSize + 8)
+        .frame(height: facingSize + 16)
+        .overlay(alignment: .trailing) {
+            trailing.padding(.trailing, 16)
+        }
+    }
+}
+
+/// Where a card sits for its distance `d` from the facing one: the nearest
+/// turn out to face you, the rest stand edge-on, turned toward the middle.
+private struct Pose {
+    let x: CGFloat
+    let turn: Double
+    let scale: CGFloat
+    let opacity: Double
+
+    init(_ d: Double, first: CGFloat, spine: CGFloat, shown: Double) {
+        let a = min(abs(d), 1)
+        let side: Double = d < 0 ? -1 : 1
+        let stacked = min(max(abs(d) - 1, 0), shown)
+        x = CGFloat(side) * (first * CGFloat(a) + spine * CGFloat(stacked))
+        turn = side * 70 * a
+        scale = 1 - 0.12 * CGFloat(a)
+        opacity = abs(d) > shown + 1 ? 0 : 1
     }
 }
 
 private struct StripThumbnail: View {
     let image: UIImage
-    let isSelected: Bool
+    let isFacing: Bool
     let side: CGFloat
+    let turn: Double
     @State private var thumbnail: UIImage?
 
     var body: some View {
-        RoundedRectangle(cornerRadius: side * 0.2, style: .continuous)
+        RoundedRectangle(cornerRadius: side * 0.22, style: .continuous)
             .fill(Color.gray.opacity(0.18))
             .overlay {
                 if let thumbnail {
@@ -94,9 +124,11 @@ private struct StripThumbnail: View {
                 }
             }
             .frame(width: side, height: side)
-            .clipShape(RoundedRectangle(cornerRadius: side * 0.2, style: .continuous))
-            .shadow(color: .black.opacity(isSelected ? 0.18 : 0), radius: 6, y: 3)
-            .opacity(isSelected ? 1 : 0.72)
+            .clipShape(RoundedRectangle(cornerRadius: side * 0.22, style: .continuous))
+            // Turned away, a card catches less light.
+            .brightness(-0.14 * min(abs(turn) / 70, 1))
+            .rotation3DEffect(.degrees(-turn), axis: (x: 0, y: 1, z: 0), perspective: 0.55)
+            .shadow(color: .black.opacity(isFacing ? 0.2 : 0.06), radius: isFacing ? 8 : 2, y: isFacing ? 4 : 1)
             .task(id: ObjectIdentifier(image)) {
                 thumbnail = await ThumbnailCache.shared.thumbnail(for: image)
             }
