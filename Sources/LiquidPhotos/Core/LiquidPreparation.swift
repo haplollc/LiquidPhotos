@@ -115,7 +115,7 @@ enum LiquidPreparation {
         let morph = LiquidMorph(heightA: a.height, heightB: b.height, toB: toB, related: related)
         // The dense flow only proposes correspondences; the mesh keeps the
         // ones that really match and moves the picture in solid pieces.
-        let proposals = flow(a, b, morph, gridLongSide: related ? 128 : 64)
+        let proposals = flow(a, b, morph, gridLongSide: related ? 128 : 96)
         return (morph, LiquidMeshFit.fit(a, b, morph, flow: proposals))
     }
 

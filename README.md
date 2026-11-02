@@ -71,17 +71,18 @@ LiquidPhotos(photos, selection: $index, isPlaying: $playing, style: LiquidPhotos
   transition moves it from the first photo's view to the second's. Position
   is eased with smootherstep and size is interpolated logarithmically, so the
   approach feels steady. The frame reshapes to the new photo along the way.
-- **Matches, not swirls.** A dense optical flow only *proposes* where things
-  went. Each proposal is kept only if a 7×7 patch looks the same in both
-  photos (correlation ≥ 0.8), so a guess that only roughly fits is never
-  shown as motion.
-- **Solid pieces.** A 24-column grid mesh is fitted to the kept matches. The
-  fit is the content-preserving warp of Liu, Gleicher, Jin & Agarwala
-  (2009), the method behind After Effects' Warp Stabilizer: every triangle
-  resists changing shape, and the fit is reweighted so a few bad matches
-  can't bend a region. Matched regions move, scale and turn as solid pieces,
-  and the rest follow their neighbours rigidly. The GPU draws the mesh as
-  triangles, so the warp is smooth everywhere.
+- **Everything moves, smoothly.** A dense optical flow proposes where every
+  part of the picture went. Each proposal is polished by a small patch
+  search. The more alike its 7×7 patches look in both photos, the harder it
+  pulls (a weak pull when they don't match). Near-identical photos therefore
+  move precisely, and very different ones still flow into each other.
+- **Solid pieces, not swirls.** A 32-column grid mesh is fitted to all
+  those pulls. The fit is the content-preserving warp of Liu, Gleicher,
+  Jin & Agarwala (2009), the method behind After Effects' Warp Stabilizer:
+  every triangle resists changing shape. The fit is reweighted so a few bad
+  proposals can't bend a region, and Accelerate's sparse Cholesky solves it
+  in milliseconds. Noisy pixel motion becomes coherent motion of whole
+  regions, and the GPU draws the mesh as triangles.
 - **Re-tinting.** Each vertex carries the local colour shift between the
   photos as a gain and an offset. Pixels shift colour as they move, so the
   same thing in different light changes its look instead of dissolving.

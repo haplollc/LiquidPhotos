@@ -196,7 +196,7 @@ fragment half4 liquidMeshFragment(
         discard_fragment();
     }
     float3 color = (aTinted * wa + bTinted * wb) / (wa + wb);
-    // Only where the mesh has something to add over the plain cross-fade.
-    float alpha = coverage * saturate(in.gain.w * 4.0);
+    // The mesh is the morph; the cross-fade beneath only fills any gap.
+    float alpha = coverage;
     return half4(half3(color) * half(alpha), half(alpha));
 }

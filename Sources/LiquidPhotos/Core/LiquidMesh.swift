@@ -15,6 +15,7 @@
 //  is the same thing in different light re-tints as it moves.
 //
 
+import Accelerate
 import Foundation
 import simd
 
@@ -66,7 +67,7 @@ enum LiquidMeshFit {
     ) -> LiquidMeshData {
         let origin = SIMD2(Double(flow.origin.x), Double(flow.origin.y))
         let size = SIMD2(Double(flow.size.x), Double(flow.size.y))
-        let columns = 24
+        let columns = 32
         let rows = min(40, max(8, Int((Double(columns) * size.y / size.x).rounded())))
 
         let span = SIMD2(Double(columns), Double(rows))
@@ -74,47 +75,48 @@ enum LiquidMeshFit {
             let t = SIMD2(Double(i), Double(j)) / span
             return origin + t * size
         }
-        let matches = morph.related ? verifiedMatches(a, b, morph, flow) : []
+        // Every flow proposal drives the morph; the ones whose patches really
+        // match pull hardest, and the mesh turns the lot into smooth, solid motion.
+        let matches = proposals(a, b, morph, flow, refine: morph.related)
         let positions = solve(columns, rows, origin, size, morph.toB, matches)
 
         // Confidence per vertex: the match weight in its neighbourhood.
         var confidence = [Double](repeating: 0, count: (columns + 1) * (rows + 1))
-        for m in matches {
+        for m in matches where m.weight > baseWeight {
             let g = (m.a - origin) / size * span
             let ci = min(max(Int(g.x.rounded()), 0), columns), cj = min(max(Int(g.y.rounded()), 0), rows)
-            confidence[cj * (columns + 1) + ci] += m.weight
+            confidence[cj * (columns + 1) + ci] += m.weight - baseWeight
         }
         confidence = smoothed(confidence, columns + 1, rows + 1, passes: 2).map { min($0 / 0.8, 1) }
 
-        // Colour shift per vertex, measured where the photos match.
+        // Colour shift per vertex, measured wherever both photos have pixels,
+        // then smoothed so the tint varies gently across the picture.
         var gains = [SIMD3<Double>](repeating: SIMD3(1, 1, 1), count: confidence.count)
         var offsets = [SIMD3<Double>](repeating: .zero, count: confidence.count)
+        var measured = [Double](repeating: 0, count: confidence.count)
         let fromB = morph.toB.inverse
         let cell = size.x / Double(columns)
         for j in 0...rows {
             for i in 0...columns {
                 let k = j * (columns + 1) + i
-                guard confidence[k] > 0.05 else { continue }
-                let pa = node(i, j)
-                if let (g, o) = colourShift(a, b, at: pa, matchedTo: positions[k], radius: cell * 0.9, toB: morph.toB) {
+                if let (g, o) = colourShift(a, b, at: node(i, j), matchedTo: positions[k], radius: cell * 1.2, toB: morph.toB) {
                     gains[k] = g
                     offsets[k] = o
+                    measured[k] = 1
                 }
             }
         }
-        // Spread the measured shifts softly into their surroundings.
         for _ in 0..<3 {
             let g0 = gains, o0 = offsets
             for j in 0...rows {
                 for i in 0...columns {
                     let k = j * (columns + 1) + i
-                    guard confidence[k] < 0.95 else { continue }
                     var sg = SIMD3<Double>.zero, so = SIMD3<Double>.zero, sw = 0.0
                     for (di, dj) in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)] {
                         let ni = i + di, nj = j + dj
                         guard ni >= 0, ni <= columns, nj >= 0, nj <= rows else { continue }
                         let n = nj * (columns + 1) + ni
-                        let w = (di == 0 && dj == 0 ? 1 : 0.5) * max(confidence[n], 0.02)
+                        let w = (di == 0 && dj == 0 ? 2.0 : 1.0) * (0.05 + measured[n])
                         sg += g0[n] * SIMD3(repeating: w)
                         so += o0[n] * SIMD3(repeating: w)
                         sw += w
@@ -151,14 +153,20 @@ enum LiquidMeshFit {
                 indices += [v00, v10, v11, v00, v11, v01]
             }
         }
-        return LiquidMeshData(columns: columns, rows: rows, vertices: vertices, indices: indices, matchCount: matches.count)
+        return LiquidMeshData(columns: columns, rows: rows, vertices: vertices, indices: indices,
+                              matchCount: matches.filter { $0.weight > baseWeight }.count)
     }
 
     // MARK: Matches
 
-    /// Flow proposals on a lattice over the first photo, each refined and
-    /// kept only if its neighbourhood looks the same in both photos.
-    static func verifiedMatches(_ a: LiquidPhotoInfo, _ b: LiquidPhotoInfo, _ morph: LiquidMorph, _ flow: LiquidMorphFlow) -> [Match] {
+    /// How hard an unverified flow proposal pulls on the mesh.
+    static let baseWeight = 0.25
+
+    /// Flow proposals on a lattice over the first photo. With `refine`, each
+    /// is polished by a small patch search, and the better its patches match
+    /// the harder it pulls; unmatched proposals still pull gently, so
+    /// everything moves, just smoothly.
+    static func proposals(_ a: LiquidPhotoInfo, _ b: LiquidPhotoInfo, _ morph: LiquidMorph, _ flow: LiquidMorphFlow, refine: Bool) -> [Match] {
         let px = 1.0 / Double(a.detail.width)            // one detail pixel, in world widths
         let radius = 3                                    // 7 × 7 patches
         let lattice = 48
@@ -174,7 +182,9 @@ enum LiquidMeshFit {
                 let i = (yi * flow.width + xi) * 4
                 return SIMD2(Double(flow.ab[i]), Double(flow.ab[i + 1]))
             }
-            return (at(x0, y0) * (1 - fx) + at(x1, y0) * fx) * (1 - fy) + (at(x0, y1) * (1 - fx) + at(x1, y1) * fx) * fy
+            let top = at(x0, y0) * (1 - fx) + at(x1, y0) * fx
+            let bottom = at(x0, y1) * (1 - fx) + at(x1, y1) * fx
+            return top * (1 - fy) + bottom * fy
         }
 
         var sa = [Float](repeating: 0, count: 147), sb = sa
@@ -182,9 +192,14 @@ enum LiquidMeshFit {
         for j in 0..<rows {
             for i in 0..<lattice {
                 let p = SIMD2((Double(i) + 0.5) / Double(lattice), (Double(j) + 0.5) / Double(rows) * a.height)
-                guard samples(a.detail, a.height, p, px, radius, nil, &sa), texture(sa) > 0.0025 else { continue }
-                // Around the flow's proposal: a coarse look, then a fine one.
                 let proposal = p + flowAB(p)
+                let q = project(morph.toB, proposal)
+                guard q.x >= 0, q.x <= 1, q.y >= 0, q.y <= b.height else { continue }
+                guard refine, samples(a.detail, a.height, p, px, radius, nil, &sa), texture(sa) > 0.0025 else {
+                    matches.append(Match(a: p, b: q, weight: baseWeight))
+                    continue
+                }
+                // Around the flow's proposal: a coarse look, then a fine one.
                 var best = (score: -1.0, at: proposal)
                 for (span, step) in [(2, 2.0), (1, 1.0)] {
                     let centre = best.at
@@ -197,8 +212,12 @@ enum LiquidMeshFit {
                         }
                     }
                 }
-                guard best.score >= 0.8 else { continue }
-                matches.append(Match(a: p, b: project(morph.toB, best.at), weight: (best.score - 0.7) / 0.3))
+                if best.score >= 0.6 {
+                    let bonus = (1 - baseWeight) * min((best.score - 0.6) / 0.35, 1)
+                    matches.append(Match(a: p, b: project(morph.toB, best.at), weight: baseWeight + bonus))
+                } else {
+                    matches.append(Match(a: p, b: q, weight: baseWeight))
+                }
             }
         }
         return matches
@@ -310,10 +329,10 @@ enum LiquidMeshFit {
                 normal.addRow([(2 * k, 1)], rhs: prior[k].x, weight: beta)
                 normal.addRow([(2 * k + 1, 1)], rhs: prior[k].y, weight: beta)
             }
-            normal.conjugateGradient(&x, iterations: round == 0 ? 400 : 200)
+            normal.solve(&x)
             guard round < 2 else { break }
             // About two detail pixels of the second photo.
-            let tolerance = 2.0 / 320
+            let tolerance = 3.0 / 320
             for (index, (m, cell)) in zip(matches, cells).enumerated() {
                 var fit = SIMD2(0.0, 0.0)
                 for (k, w) in cell { fit += SIMD2(x[2 * k], x[2 * k + 1]) * w }
@@ -393,6 +412,50 @@ struct SparseNormal {
                 entries[i][j, default: 0] += weight * ai * aj
             }
         }
+    }
+
+    /// Solves the system with Accelerate's sparse Cholesky factorisation
+    /// (milliseconds, in any build), falling back to conjugate gradient.
+    func solve(_ x: inout [Double]) {
+        // Compressed sparse columns of the lower triangle.
+        var starts = [Int](repeating: 0, count: size + 1)
+        var rowIndices: [Int32] = []
+        var values: [Double] = []
+        for j in 0..<size {
+            starts[j] = values.count
+            for (i, v) in entries[j].sorted(by: { $0.key < $1.key }) where i >= j {
+                rowIndices.append(Int32(i))
+                values.append(v)
+            }
+        }
+        starts[size] = values.count
+        var b = rhs
+        let solved: Bool = starts.withUnsafeMutableBufferPointer { sp in
+            rowIndices.withUnsafeMutableBufferPointer { rp in
+                values.withUnsafeMutableBufferPointer { vp in
+                    var attributes = SparseAttributes_t()
+                    attributes.triangle = SparseLowerTriangle
+                    attributes.kind = SparseSymmetric
+                    let structure = SparseMatrixStructure(
+                        rowCount: Int32(size), columnCount: Int32(size),
+                        columnStarts: sp.baseAddress!, rowIndices: rp.baseAddress!,
+                        attributes: attributes, blockSize: 1
+                    )
+                    let matrix = SparseMatrix_Double(structure: structure, data: vp.baseAddress!)
+                    let factors = SparseFactor(SparseFactorizationCholesky, matrix)
+                    defer { SparseCleanup(factors) }
+                    guard factors.status == SparseStatusOK else { return false }
+                    return b.withUnsafeMutableBufferPointer { bp in
+                        x.withUnsafeMutableBufferPointer { xp in
+                            SparseSolve(factors, DenseVector_Double(count: Int32(size), data: bp.baseAddress!),
+                                        DenseVector_Double(count: Int32(size), data: xp.baseAddress!))
+                            return true
+                        }
+                    }
+                }
+            }
+        }
+        if !solved { conjugateGradient(&x, iterations: 400) }
     }
 
     func conjugateGradient(_ x: inout [Double], iterations: Int) {
