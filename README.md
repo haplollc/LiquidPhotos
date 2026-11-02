@@ -72,6 +72,10 @@ Use the album as is, or take it apart.
 | 🌊 | **`LiquidPhotos`** | Just the stage. It shows one photo at a time and flows into whichever you select. |
 | 💿 | **`LiquidPhotoStrip`** | Just the shelf. The selected photo faces you, the rest stand edge-on, and choosing another flips it out in 3D. Tap or drag it. |
 
+<p align="center">
+  <img src="assets/shelf.webp" width="560" alt="The shelf: the photo on screen faces you, the rest stand edge-on like CDs, and each change flips the next one out">
+</p>
+
 Build your own controls around the stage and the shelf:
 
 ```swift
