@@ -17,6 +17,12 @@
   <img src="https://img.shields.io/badge/License-MIT-blue" alt="MIT License" />
 </p>
 
+<p align="center">
+  <a href="https://buymeacoffee.com/jcbuilds"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" width="200"></a>
+  <br>
+  <sub>If LiquidPhotos is useful to you, a coffee keeps it going.</sub>
+</p>
+
 ---
 
 ```swift
